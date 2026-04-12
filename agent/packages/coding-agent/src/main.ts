@@ -660,8 +660,45 @@ async function handleConfigCommand(args: string[]): Promise<boolean> {
 	process.exit(0);
 }
 
+/**
+ * Detect solver mode (--mode json --no-session) and apply defaults that
+ * eliminate token waste from extensions, skills, prompts, themes, and
+ * version checks. Keep medium thinking — reasoning quality drives diff precision.
+ */
+function applySolverModeDefaults(args: string[]): void {
+	const hasMode = args.includes("--mode");
+	const hasNoSession = args.includes("--no-session");
+
+	if (hasMode && hasNoSession) {
+		// Force offline and skip version check
+		process.env.PI_OFFLINE = "1";
+		process.env.PI_SKIP_VERSION_CHECK = "1";
+
+		// Disable extensions, skills, prompt templates, themes if not already set
+		const disableFlags = [
+			"--no-extensions",
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-themes",
+		];
+		for (const flag of disableFlags) {
+			if (!args.includes(flag)) {
+				args.push(flag);
+			}
+		}
+
+		// Default thinking to "medium" — reasoning is critical for producing
+		// correct, minimal, precisely-positioned diffs that match Cursor's output.
+		// "off" saves tokens but produces sloppier edits that hurt score.
+		if (!args.includes("--thinking")) {
+			args.push("--thinking", "medium");
+		}
+	}
+}
+
 export async function main(args: string[]) {
 	resetTimings();
+	applySolverModeDefaults(args);
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
 		process.env.PI_OFFLINE = "1";
