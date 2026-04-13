@@ -149,8 +149,18 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
+// === TAU SN66 RUNTIME STEERING CONSTANTS ===
+const MAX_PROVIDER_ERROR_RETRIES = 100;
+const MAX_READS_BEFORE_EDIT = 2;
+const MAX_NO_TOOL_RETRIES = 2;
+const EDIT_ERROR_THRESHOLD_PER_FILE = 2;
+const TIME_WARNING_MS = 20_000;
+const HARD_EXIT_MS = 170_000;
+const CONNECTION_REFUSED_PATTERNS = ["ConnectionRefusedError", "Connection refused", "ECONNREFUSED"];
+
 /**
  * Main loop logic shared by agentLoop and agentLoopContinue.
+ * Includes tau SN66 runtime steering heuristics for maximizing duel score.
  */
 async function runLoop(
 	currentContext: AgentContext,
@@ -161,15 +171,48 @@ async function runLoop(
 	streamFn?: StreamFn,
 ): Promise<void> {
 	let firstTurn = true;
-	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+
+	// === TAU STEERING STATE ===
+	const loopStartMs = Date.now();
+	let editSuccessCount = 0;
+	let readsBeforeEdit = 0;
+	let providerErrorRetries = 0;
+	let noToolRetries = 0;
+	let timeWarningIssued = false;
+	const consecutiveEditErrors = new Map<string, number>();
+	const lastFailedOldText = new Map<string, string>();
+
+	/** Inject a steering message into the conversation. */
+	const injectSteering = async (text: string): Promise<void> => {
+		const msg: AgentMessage = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text }],
+			timestamp: Date.now(),
+		};
+		currentContext.messages.push(msg);
+		newMessages.push(msg);
+		await emit({ type: "message_start", message: msg });
+		await emit({ type: "message_end", message: msg });
+	};
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
+		// === HARD EXIT CHECK ===
+		if (Date.now() - loopStartMs >= HARD_EXIT_MS) {
+			await injectSteering("TIME LIMIT REACHED. Stopping now to preserve your edits.");
+			break;
+		}
+
 		let hasMoreToolCalls = true;
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			// Hard exit inside inner loop
+			if (Date.now() - loopStartMs >= HARD_EXIT_MS) {
+				break;
+			}
+
 			if (!firstTurn) {
 				await emit({ type: "turn_start" });
 			} else {
@@ -191,7 +234,24 @@ async function runLoop(
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
 
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
+			// === PROVIDER ERROR RETRY (v15.1) ===
+			if (message.stopReason === "error") {
+				if (providerErrorRetries < MAX_PROVIDER_ERROR_RETRIES) {
+					providerErrorRetries++;
+					await emit({ type: "turn_end", message, toolResults: [] });
+					await injectSteering(
+						"Provider returned an error. Continue where you left off. If you were about to call a tool, call it now.",
+					);
+					hasMoreToolCalls = true;
+					continue;
+				}
+				// Exhausted retries
+				await emit({ type: "turn_end", message, toolResults: [] });
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			if (message.stopReason === "aborted") {
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -201,6 +261,17 @@ async function runLoop(
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 			hasMoreToolCalls = toolCalls.length > 0;
 
+			// === NO TOOL RETRY (v16) ===
+			if (!hasMoreToolCalls && editSuccessCount === 0 && noToolRetries < MAX_NO_TOOL_RETRIES) {
+				noToolRetries++;
+				await emit({ type: "turn_end", message, toolResults: [] });
+				await injectSteering(
+					"You must make edits. Call the read tool on the files you need to change, then use edit. Do not stop without editing.",
+				);
+				hasMoreToolCalls = true;
+				continue;
+			}
+
 			const toolResults: ToolResultMessage[] = [];
 			if (hasMoreToolCalls) {
 				toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit)));
@@ -208,6 +279,85 @@ async function runLoop(
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
 					newMessages.push(result);
+				}
+
+				// === ANALYZE TOOL RESULTS ===
+				for (let i = 0; i < toolCalls.length; i++) {
+					const tc = toolCalls[i];
+					const tr = toolResults[i];
+					if (!tc || !tr) continue;
+
+					const toolName = tc.name;
+					const resultText =
+						tr.content
+							?.map((c: { type: string; text?: string }) => (c.type === "text" ? c.text || "" : ""))
+							.join("") || "";
+
+					// === CONNECTION REFUSED DETECTION (v2) ===
+					if (
+						toolName === "bash" &&
+						CONNECTION_REFUSED_PATTERNS.some((p) => resultText.includes(p))
+					) {
+						await injectSteering(
+							"STOP: Sandbox has NO services. Do NOT retry connections. Call read or edit NOW.",
+						);
+					}
+
+					// === EXPLORATION BUDGET (v16) ===
+					if ((toolName === "read" || toolName === "bash") && editSuccessCount === 0) {
+						readsBeforeEdit++;
+						if (readsBeforeEdit >= MAX_READS_BEFORE_EDIT) {
+							await injectSteering("You have read enough files. Call edit NOW.");
+						}
+					}
+
+					// === EDIT ERROR RECOVERY (v15.2 + v2 lastFailedOldText) ===
+					if (toolName === "edit") {
+						const args = tc.arguments as Record<string, unknown>;
+						const filePath = (args.file_path || args.path || "") as string;
+						const oldText = (args.old_string || args.oldText || "") as string;
+
+						if (tr.isError) {
+							// Same oldText twice detection
+							const prevOldText = lastFailedOldText.get(filePath);
+							if (prevOldText && prevOldText === oldText) {
+								await injectSteering(
+									`Edit on ${filePath} failed with SAME oldText twice. Call read on it NOW, then retry.`,
+								);
+							}
+							lastFailedOldText.set(filePath, oldText);
+
+							const errCount = (consecutiveEditErrors.get(filePath) || 0) + 1;
+							consecutiveEditErrors.set(filePath, errCount);
+							if (errCount >= EDIT_ERROR_THRESHOLD_PER_FILE) {
+								await injectSteering(
+									`${errCount} consecutive edit failures on ${filePath}. Re-read the file with the read tool, then use a shorter unique oldText (3-5 lines). Or move to a different file first.`,
+								);
+							}
+						} else {
+							// === EDIT SUCCESS ===
+							editSuccessCount++;
+							consecutiveEditErrors.set(filePath, 0);
+							lastFailedOldText.delete(filePath);
+
+							// === POST-EDIT STALENESS WARNING ===
+							await injectSteering(
+								`File ${filePath} has been modified. Its contents are now stale in your context. If you need to edit it again, re-read it first.`,
+							);
+						}
+					}
+				}
+
+				// === TIME WARNING (v17) ===
+				if (
+					!timeWarningIssued &&
+					editSuccessCount === 0 &&
+					Date.now() - loopStartMs >= TIME_WARNING_MS
+				) {
+					timeWarningIssued = true;
+					await injectSteering(
+						"WARNING: Time is running out and you have not made any edits yet. Start editing immediately. Every second counts.",
+					);
 				}
 			}
 
