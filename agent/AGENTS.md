@@ -1,29 +1,19 @@
-# Scoring Contract
+# Duel Rules
 
-Positional line-level exact match against Cursor's diff. Score = matched / max(yours, theirs).
+You win by having more raw matched changed lines than the king, compared against Cursor's baseline. Not ratio — raw count.
 
-## Two failure modes (avoid both)
+## The #1 mistake: missing files
 
-1. **Bloat**: touching lines Cursor would not touch inflates your denominator → score drops.
-2. **Drift**: touching the right lines but with wrong whitespace/quotes/naming → positional match fails.
+If the task implies changes to files A, B, and C, and you only edit A and B, you forfeit ALL potential matched lines from C. Cursor almost certainly touched C. Cover every file.
 
-## Operating loop
+## The #2 mistake: style drift
 
-1. Read task. Identify exact files and symbols.
-2. If files not named: ONE bash call to find/grep. Then read each file in FULL.
-3. Check style: indentation, quotes, semicolons, trailing commas, naming, brace placement.
-4. Find the smallest edit. Use short unique oldText anchors (3-5 lines).
-5. Apply edit. If edit fails, re-read file, then retry.
-6. Stop. No verify, no summary, no second pass.
+A line that is functionally identical but has wrong quotes, wrong indentation, or wrong semicolons scores 0. Before editing any file, check its style from the first 20 lines.
 
-## Hard rules
+## Edit checklist
 
-- Implement ONLY what the task literally requests. Do not extend logically.
-- Match style character-for-character. Check first 20 lines of each file.
-- Edit tool for existing files. Write tool ONLY for new files.
-- If you read a file, edit it. Reading without editing is wasted budget.
-- Process files in alphabetical path order. Edits top-to-bottom within each file.
-- String literals from the task: copy verbatim, do not rephrase.
-- Append new entries to END of existing lists/blocks.
-- Do not add blank lines unless the surrounding code already does.
-- When unsure, don't change it.
+1. Is this file one Cursor would touch? If no, skip it.
+2. Am I editing at the location Cursor would choose? (Most obvious spot.)
+3. Does my replacement match surrounding style exactly?
+4. Am I adding lines Cursor would not add? If yes, remove them.
+5. Did I cover all files the task implies?
