@@ -2,8 +2,86 @@
  * System prompt construction and project context loading
  */
 
+import { execSync } from "node:child_process";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
+
+/**
+ * Extract keywords from task text and grep the codebase to find likely relevant files.
+ * Returns a prompt section listing the top matching files, giving the model a head start.
+ */
+function grepTaskKeywords(taskText: string, cwd: string): string {
+	// Extract keywords: backtick-quoted terms, camelCase, snake_case identifiers
+	const keywords = new Set<string>();
+
+	// Backtick-quoted terms
+	const backtickMatches = taskText.match(/`([^`]+)`/g);
+	if (backtickMatches) {
+		for (const m of backtickMatches) {
+			const term = m.slice(1, -1).trim();
+			if (term.length >= 3 && term.length <= 80 && !term.includes(" ")) {
+				keywords.add(term);
+			}
+		}
+	}
+
+	// camelCase and PascalCase identifiers (3+ chars)
+	const camelMatches = taskText.match(/\b[a-z][a-zA-Z0-9]{2,30}\b/g);
+	if (camelMatches) {
+		for (const m of camelMatches) {
+			if (/[A-Z]/.test(m)) keywords.add(m);
+		}
+	}
+
+	// snake_case identifiers
+	const snakeMatches = taskText.match(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g);
+	if (snakeMatches) {
+		for (const m of snakeMatches) {
+			if (m.length >= 4) keywords.add(m);
+		}
+	}
+
+	if (keywords.size === 0) return "";
+
+	const srcExtensions = "ts,tsx,js,jsx,py,go,rs,java,c,cpp,h,hpp,cs,rb,php,swift,kt,scala,vue,svelte";
+	const keywordList = [...keywords].slice(0, 20);
+
+	try {
+		// Run grep for each keyword, collect file hits
+		const fileCounts = new Map<string, number>();
+		for (const kw of keywordList) {
+			const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			try {
+				const result = execSync(
+					`grep -rl "${escaped}" --include="*.{${srcExtensions}}" . 2>/dev/null | grep -v node_modules | grep -v '/\\.git/' | grep -v '/dist/' | grep -v '/build/' | head -20`,
+					{ cwd, timeout: 5000, encoding: "utf8" },
+				);
+				for (const line of result.trim().split("\n")) {
+					const file = line.trim();
+					if (file) fileCounts.set(file, (fileCounts.get(file) || 0) + 1);
+				}
+			} catch {
+				// grep returns exit code 1 if no matches — ignore
+			}
+		}
+
+		if (fileCounts.size === 0) return "";
+
+		// Sort by match count descending, take top 15
+		const sorted = [...fileCounts.entries()]
+			.sort((a, b) => b[1] - a[1])
+			.slice(0, 15);
+
+		let section = "\n\nLIKELY RELEVANT FILES (auto-discovered from task keywords):\n";
+		for (const [file, count] of sorted) {
+			section += `- ${file} (${count} keyword${count > 1 ? "s" : ""})\n`;
+		}
+		section += "Start by reading the top-ranked files above.\n";
+		return section;
+	} catch {
+		return "";
+	}
+}
 
 /**
  * Tau scoring preamble — prepended to every system prompt for SN66 scoring optimization.
@@ -58,6 +136,7 @@ SCOPE ESTIMATION:
 - Count acceptance criteria. Tasks have 100+ changed lines across 1-5 files typically.
 - 4+ criteria almost always need 4+ edits across 2+ files.
 - Do not stop after one file if the task implies changes to multiple files.
+- After editing a file, check sibling files: ls $(dirname <path>)/ — related files often need changes too.
 
 `;
 
@@ -103,7 +182,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 	const skills = providedSkills ?? [];
 
 	if (customPrompt) {
-		let prompt = TAU_SCORING_PREAMBLE + customPrompt;
+		const keywordHits = grepTaskKeywords(customPrompt, resolvedCwd);
+		let prompt = TAU_SCORING_PREAMBLE + keywordHits + customPrompt;
 
 		if (appendSection) {
 			prompt += appendSection;

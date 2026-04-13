@@ -663,7 +663,7 @@ async function handleConfigCommand(args: string[]): Promise<boolean> {
 /**
  * Detect solver mode (--mode json --no-session) and apply defaults that
  * eliminate token waste from extensions, skills, prompts, themes, and
- * version checks. Keep medium thinking — reasoning quality drives diff precision.
+ * version checks. Disable thinking to maximize token budget for edits.
  */
 function applySolverModeDefaults(args: string[]): void {
 	const hasMode = args.includes("--mode");
@@ -687,11 +687,11 @@ function applySolverModeDefaults(args: string[]): void {
 			}
 		}
 
-		// Default thinking to "medium" — reasoning is critical for producing
-		// correct, minimal, precisely-positioned diffs that match Cursor's output.
-		// "off" saves tokens but produces sloppier edits that hurt score.
+		// Default thinking to "off" — saves tokens for actual file reads and edits.
+		// Gemini 2.5 Flash doesn't benefit much from extended thinking, and the
+		// runtime steering heuristics compensate for reasoning quality.
 		if (!args.includes("--thinking")) {
-			args.push("--thinking", "medium");
+			args.push("--thinking", "off");
 		}
 	}
 }
