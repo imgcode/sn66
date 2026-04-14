@@ -107,7 +107,9 @@ import { createWriteTool, createWriteToolDefinition, writeTool, writeToolDefinit
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
 
-export const codingTools: Tool[] = [readTool, bashTool, editTool, writeTool];
+// Include findTool in the default solver toolset so the model has a structured
+// glob-based file discovery option alongside bash.
+export const codingTools: Tool[] = [readTool, bashTool, editTool, writeTool, findTool];
 export const readOnlyTools: Tool[] = [readTool, grepTool, findTool, lsTool];
 
 export const allTools = {
@@ -173,6 +175,7 @@ export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
 		createBashTool(cwd, options?.bash),
 		createEditTool(cwd),
 		createWriteTool(cwd),
+		createFindTool(cwd),
 	];
 }
 

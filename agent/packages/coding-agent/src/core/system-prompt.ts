@@ -4,171 +4,90 @@
 
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
 
-const SRC_EXTENSIONS_REGEX = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|c|cpp|cc|h|hpp|cs|rb|php|swift|kt|scala|vue|svelte|md|json|yaml|yml|toml)$/i;
-const SRC_EXTENSIONS_GLOB = "ts,tsx,js,jsx,mjs,cjs,py,go,rs,java,c,cpp,cc,h,hpp,cs,rb,php,swift,kt,scala,vue,svelte,md,json,yaml,yml,toml";
+// Common English stop words to filter out of keyword extraction
+const STOP_WORDS = new Set([
+	"the",
+	"and",
+	"for",
+	"with",
+	"that",
+	"this",
+	"from",
+	"should",
+	"must",
+	"when",
+	"each",
+	"into",
+	"also",
+	"have",
+	"been",
+	"will",
+	"they",
+	"them",
+	"their",
+	"there",
+	"which",
+	"what",
+	"where",
+	"while",
+	"would",
+	"could",
+	"these",
+	"those",
+	"then",
+	"than",
+	"some",
+	"more",
+	"other",
+	"only",
+	"just",
+	"like",
+	"such",
+	"make",
+	"made",
+	"does",
+	"doing",
+	"being",
+]);
 
-interface ExtractedKeywords {
-	backtickTerms: Set<string>;
-	identifiers: Set<string>;
-	filePaths: Set<string>;
-	importPaths: Set<string>;
-	errorStrings: Set<string>;
+/**
+ * Count acceptance criteria bullets in a task description.
+ */
+function countAcceptanceCriteria(taskText: string): number {
+	const section = taskText.match(
+		/(?:acceptance\s+criteria|requirements|tasks?|todo):?\s*\n([\s\S]*?)(?:\n\n|\n(?=[A-Z])|\n(?=##)|$)/i,
+	);
+	if (!section) {
+		// Fallback: count top-level bullets anywhere
+		const allBullets = taskText.match(/^\s*(?:[-*•+]|\d+[.)])\s+/gm);
+		return allBullets ? Math.min(allBullets.length, 20) : 0;
+	}
+	const bullets = section[1].match(/^\s*(?:[-*•+]|\d+[.)])\s+/gm);
+	return bullets ? bullets.length : 0;
 }
 
 /**
- * Extract structured keywords from task text.
- * - backtickTerms: `foo.bar()`, `handleError` — highest confidence from task
- * - identifiers: camelCase, snake_case, PascalCase symbols
- * - filePaths: explicit file paths like src/auth/login.ts
- * - importPaths: from './foo', import { x } from 'y'
- * - errorStrings: quoted error messages
+ * Extract file-like names from backticks (e.g. `foo.ts`).
  */
-function extractKeywords(taskText: string): ExtractedKeywords {
-	const result: ExtractedKeywords = {
-		backtickTerms: new Set(),
-		identifiers: new Set(),
-		filePaths: new Set(),
-		importPaths: new Set(),
-		errorStrings: new Set(),
-	};
-
-	// 1. Backtick-quoted terms (highest confidence from task)
-	const backticks = taskText.match(/`([^`]+)`/g);
-	if (backticks) {
-		for (const m of backticks) {
-			const term = m.slice(1, -1).trim();
-			if (term.length < 3 || term.length > 120) continue;
-			// Whole term if it has no spaces
-			if (!term.includes(" ") && !term.includes("\n")) {
-				result.backtickTerms.add(term);
-			}
-			// Also extract embedded identifiers from backtick terms
-			const embedded = term.match(/\b[a-zA-Z_][a-zA-Z0-9_]{2,60}\b/g);
-			if (embedded) for (const id of embedded) result.identifiers.add(id);
-		}
-	}
-
-	// 2. File paths (src/foo/bar.ts, ./lib/auth, packages/foo/src/x.js, etc.)
-	// Terminator includes `.` so sentence-end-adjacent paths still match.
-	const filePathRe = /(?:^|[\s"'`(\[])((?:\.\.?\/|\/)?(?:[a-zA-Z0-9_-]+\/)+[a-zA-Z0-9_-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|c|cpp|cc|h|hpp|cs|rb|php|swift|kt|scala|vue|svelte|md|json|yaml|yml|toml))(?=$|[\s"'`)\],:;.])/g;
-	let fpMatch: RegExpExecArray | null;
-	while ((fpMatch = filePathRe.exec(taskText)) !== null) {
-		const p = fpMatch[1].replace(/^\.?\//, "");
-		if (p.length >= 3 && p.length <= 200) result.filePaths.add(p);
-	}
-
-	// 3. Import paths (from './foo', require('./bar'))
-	const importRe = /(?:from|require|import)\s*\(?['"`]([^'"`\n]+)['"`]/g;
-	let imMatch: RegExpExecArray | null;
-	while ((imMatch = importRe.exec(taskText)) !== null) {
-		const p = imMatch[1];
-		if (p.length >= 2 && p.length <= 200) result.importPaths.add(p);
-	}
-
-	// 4. Quoted error-message strings: "something went wrong", 'xyz'
-	const stringRe = /["']([^"'\n]{10,120})["']/g;
-	let strMatch: RegExpExecArray | null;
-	while ((strMatch = stringRe.exec(taskText)) !== null) {
-		const s = strMatch[1].trim();
-		// Look for error-ish strings (multi-word) but also catch enum-like values
-		if (/\s/.test(s) || /^[A-Z_]{3,}$/.test(s)) {
-			result.errorStrings.add(s);
-		}
-	}
-
-	// 5. camelCase / PascalCase identifiers
-	const camelMatches = taskText.match(/\b[a-zA-Z][a-zA-Z0-9]{2,40}\b/g);
-	if (camelMatches) {
-		for (const m of camelMatches) {
-			if (/[a-z][A-Z]|[A-Z][a-z]/.test(m)) result.identifiers.add(m);
-		}
-	}
-
-	// 6. snake_case identifiers
-	const snakeMatches = taskText.match(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g);
-	if (snakeMatches) {
-		for (const m of snakeMatches) {
-			if (m.length >= 4) result.identifiers.add(m);
-		}
-	}
-
-	// 7. SCREAMING_SNAKE_CASE constants
-	const screamMatches = taskText.match(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g);
-	if (screamMatches) {
-		for (const m of screamMatches) {
-			if (m.length >= 4) result.identifiers.add(m);
-		}
-	}
-
-	return result;
-}
-
-/**
- * Shell-escape a string for use inside double-quoted bash argument.
- */
-function shellEscape(s: string): string {
-	return s.replace(/[\\"`$]/g, "\\$&");
-}
-
-/**
- * Run grep across the codebase for a set of keywords and return a Map<file, score>.
- * Score is weighted by keyword type.
- */
-function grepKeywords(
-	cwd: string,
-	keywords: { term: string; weight: number }[],
-): Map<string, number> {
-	const fileScores = new Map<string, number>();
-	for (const { term, weight } of keywords) {
-		if (!term || term.length < 2) continue;
-		const escaped = shellEscape(term);
-		try {
-			const result = execSync(
-				`grep -rlF "${escaped}" --include="*.{${SRC_EXTENSIONS_GLOB}}" . 2>/dev/null | grep -v node_modules | grep -v '/\\.git/' | grep -v '/dist/' | grep -v '/build/' | grep -v '/out/' | grep -v '/.next/' | grep -v '/target/' | head -30`,
-				{ cwd, timeout: 5000, encoding: "utf8", maxBuffer: 2 * 1024 * 1024 },
-			);
-			for (const line of result.split("\n")) {
-				const file = line.trim().replace(/^\.\//, "");
-				if (file) fileScores.set(file, (fileScores.get(file) || 0) + weight);
-			}
-		} catch {
-			// grep returns exit 1 on no match — ignore
-		}
-	}
-	return fileScores;
-}
-
-/**
- * Verify and resolve file paths that were literally mentioned in the task.
- * Returns the set of paths that exist in the repo.
- */
-function resolveLiteralFilePaths(cwd: string, paths: Set<string>): Set<string> {
-	const resolved = new Set<string>();
-	for (const p of paths) {
-		try {
-			const full = resolve(cwd, p);
-			if (existsSync(full) && statSync(full).isFile()) {
-				resolved.add(p.replace(/^\.\//, ""));
-			}
-		} catch {
-			// ignore
-		}
-	}
-	return resolved;
+function extractNamedFiles(taskText: string): string[] {
+	const matches = taskText.match(/`([^`]+\.[a-zA-Z0-9]{1,6})`/g) || [];
+	return [...new Set(matches.map((f) => f.replace(/`/g, "").trim()))];
 }
 
 /**
  * Detect code style from a file's first 30 lines.
- * Returns a short description string to inject into the prompt.
+ * Returns a short description string.
  */
 function detectFileStyle(cwd: string, relPath: string): string | null {
 	try {
 		const full = resolve(cwd, relPath);
 		if (!existsSync(full)) return null;
+		const stat = statSync(full);
+		if (!stat.isFile() || stat.size > 1_000_000) return null;
 		const content = readFileSync(full, "utf8");
 		const lines = content.split("\n").slice(0, 40);
 		if (lines.length === 0) return null;
@@ -203,126 +122,160 @@ function detectFileStyle(cwd: string, relPath: string): string | null {
 		}
 
 		// Quote style
-		const singleQuotes = (content.match(/'/g) || []).length;
-		const doubleQuotes = (content.match(/"/g) || []).length;
-		const backtickQuotes = (content.match(/`/g) || []).length;
+		const single = (content.match(/'/g) || []).length;
+		const double = (content.match(/"/g) || []).length;
 		let quotes = "mixed";
-		if (singleQuotes > doubleQuotes * 1.5) quotes = "single";
-		else if (doubleQuotes > singleQuotes * 1.5) quotes = "double";
-		else if (backtickQuotes > singleQuotes && backtickQuotes > doubleQuotes) quotes = "backtick";
+		if (single > double * 1.5) quotes = "single";
+		else if (double > single * 1.5) quotes = "double";
 
 		// Semicolons
-		let linesWithCode = 0;
-		let linesEndingSemi = 0;
+		let codeLines = 0;
+		let semiLines = 0;
 		for (const line of lines) {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("*")) continue;
-			linesWithCode++;
-			if (trimmed.endsWith(";")) linesEndingSemi++;
+			const t = line.trim();
+			if (!t || t.startsWith("//") || t.startsWith("#") || t.startsWith("*")) continue;
+			codeLines++;
+			if (t.endsWith(";")) semiLines++;
 		}
-		const semis = linesWithCode === 0 ? "unknown" : linesEndingSemi / linesWithCode > 0.3 ? "yes" : "no";
+		const semis = codeLines === 0 ? "unknown" : semiLines / codeLines > 0.3 ? "yes" : "no";
 
-		// Trailing commas
-		const trailingCommas = /,\s*[\n\r]\s*[)\]}]/.test(content) ? "yes" : "no";
+		const trailing = /,\s*[\n\r]\s*[)\]}]/.test(content) ? "yes" : "no";
 
-		return `indent=${indent}, quotes=${quotes}, semicolons=${semis}, trailing-commas=${trailingCommas}`;
+		return `indent=${indent}, quotes=${quotes}, semicolons=${semis}, trailing-commas=${trailing}`;
 	} catch {
 		return null;
 	}
 }
 
 /**
- * Extract acceptance criteria bullets from a task.
- * Looks for markdown bullets, numbered lists, or "Acceptance criteria:" sections.
+ * Shell-escape a keyword for use inside double-quoted bash arguments.
  */
-function extractAcceptanceCriteria(taskText: string): string[] {
-	const criteria: string[] = [];
-	const lines = taskText.split("\n");
-	let inCriteriaSection = false;
-	for (const line of lines) {
-		const trimmed = line.trim();
-		if (/^(acceptance criteria|requirements|todo|tasks?):?\s*$/i.test(trimmed)) {
-			inCriteriaSection = true;
-			continue;
-		}
-		// Bullet patterns
-		const bulletMatch = trimmed.match(/^(?:[-*+]|\d+[.)])\s+(.{5,200})/);
-		if (bulletMatch) {
-			criteria.push(bulletMatch[1].trim());
-			continue;
-		}
-		// Blank line in criteria section ends it
-		if (inCriteriaSection && !trimmed) {
-			inCriteriaSection = false;
-		}
-	}
-	return criteria.slice(0, 12);
+function shellEscape(s: string): string {
+	return s.replace(/[\\"`$]/g, "\\$&");
 }
 
 /**
- * Main entry: build the auto-discovery prompt section.
- * Combines keyword grep, literal path resolution, style detection, and criteria extraction.
+ * Analyze the task text and produce a discovery section prepended to the prompt.
+ * - Extracts keywords (backtick, camelCase, snake_case, kebab-case, path-like, SCREAMING_SNAKE).
+ * - Greps the codebase and ranks files by match count.
+ * - Resolves literal file paths (exists-checked) and boosts them.
+ * - Detects style of the top-ranked file.
+ * - Extracts acceptance criteria bullets.
+ *
+ * Output format uses "FILES EXPLICITLY NAMED IN THE TASK" and "LIKELY RELEVANT FILES"
+ * section headers so that parseExpectedFiles() in agent-loop.ts can parse them.
  */
 function buildTaskDiscoverySection(taskText: string, cwd: string): string {
-	const kw = extractKeywords(taskText);
-	if (
-		kw.backtickTerms.size === 0 &&
-		kw.identifiers.size === 0 &&
-		kw.filePaths.size === 0 &&
-		kw.errorStrings.size === 0
-	) {
-		return "";
+	const keywords = new Set<string>();
+
+	// Backtick-quoted terms (highest signal)
+	const backticks = taskText.match(/`([^`]{2,80})`/g) || [];
+	for (const b of backticks) {
+		const term = b.slice(1, -1).trim();
+		if (term.length >= 2 && term.length <= 80) keywords.add(term);
 	}
 
-	// Weighted keyword grep — backtick terms and file path basenames get higher weight
-	const weighted: { term: string; weight: number }[] = [];
-	for (const t of kw.backtickTerms) weighted.push({ term: t, weight: 3 });
-	for (const p of kw.filePaths) {
-		// Grep for the basename (without extension) as a strong signal
-		const base = p.split("/").pop()?.replace(/\.[^.]+$/, "");
-		if (base && base.length >= 3) weighted.push({ term: base, weight: 3 });
+	// camelCase / PascalCase
+	const camel = taskText.match(/\b[A-Za-z][a-z]+(?:[A-Z][a-zA-Z0-9]*)+\b/g) || [];
+	for (const c of camel) keywords.add(c);
+
+	// snake_case
+	const snake = taskText.match(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g) || [];
+	for (const s of snake) keywords.add(s);
+
+	// kebab-case
+	const kebab = taskText.match(/\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b/g) || [];
+	for (const k of kebab) keywords.add(k);
+
+	// SCREAMING_SNAKE_CASE
+	const scream = taskText.match(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g) || [];
+	for (const s of scream) keywords.add(s);
+
+	// Path-like tokens (src/foo/bar.ts, packages/x/y.js)
+	const pathLike = taskText.match(/(?:^|[\s"'`(\[])((?:\.\.?\/|\/)?(?:[\w.-]+\/)+[\w.-]+\.[a-zA-Z]{1,6})(?=$|[\s"'`)\],:;.])/g) || [];
+	const paths = new Set<string>();
+	for (const p of pathLike) {
+		const cleaned = p.trim().replace(/^[\s"'`(\[]/, "").replace(/^\.\//, "");
+		paths.add(cleaned);
+		keywords.add(cleaned);
 	}
-	for (const id of kw.identifiers) weighted.push({ term: id, weight: 1 });
-	for (const err of kw.errorStrings) {
-		if (err.length <= 80) weighted.push({ term: err, weight: 2 });
+
+	// Also extract file paths from inside backticks
+	for (const b of backticks) {
+		const inner = b.slice(1, -1).trim();
+		if (/^[\w./-]+\.[a-zA-Z0-9]{1,6}$/.test(inner) && inner.length < 200) {
+			paths.add(inner.replace(/^\.\//, ""));
+		}
 	}
 
-	// Limit number of grep calls
-	const limited = weighted.slice(0, 25);
-	const fileScores = grepKeywords(cwd, limited);
+	const filtered = [...keywords]
+		.filter((k) => k.length >= 3 && k.length <= 80)
+		.filter((k) => !/["']/.test(k))
+		.filter((k) => !STOP_WORDS.has(k.toLowerCase()))
+		.slice(0, 20);
 
-	// Literal file paths mentioned in task — boost these heavily
-	const literalPaths = resolveLiteralFilePaths(cwd, kw.filePaths);
-	for (const p of literalPaths) {
-		fileScores.set(p, (fileScores.get(p) || 0) + 10);
+	if (filtered.length === 0 && paths.size === 0) return "";
+
+	// Grep each keyword for file hits
+	const fileHits = new Map<string, Set<string>>();
+	const includeGlobs =
+		'--include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.mjs" --include="*.cjs" --include="*.py" --include="*.go" --include="*.rs" --include="*.java" --include="*.kt" --include="*.scala" --include="*.dart" --include="*.rb" --include="*.cs" --include="*.cpp" --include="*.c" --include="*.h" --include="*.hpp" --include="*.vue" --include="*.svelte" --include="*.css" --include="*.scss" --include="*.html" --include="*.json" --include="*.yaml" --include="*.yml" --include="*.toml" --include="*.md"';
+
+	for (const kw of filtered) {
+		try {
+			const escaped = shellEscape(kw);
+			const result = execSync(
+				`grep -rlF "${escaped}" ${includeGlobs} . 2>/dev/null | grep -v node_modules | grep -v '/\\.git/' | grep -v '/dist/' | grep -v '/build/' | grep -v '/out/' | grep -v '/\\.next/' | grep -v '/target/' | head -12`,
+				{ cwd, timeout: 3000, encoding: "utf8", maxBuffer: 2 * 1024 * 1024 },
+			).trim();
+			if (result) {
+				for (const line of result.split("\n")) {
+					const file = line.trim().replace(/^\.\//, "");
+					if (!file) continue;
+					if (!fileHits.has(file)) fileHits.set(file, new Set());
+					fileHits.get(file)!.add(kw);
+				}
+			}
+		} catch {
+			// grep exit 1 on no match — ignore
+		}
 	}
 
-	if (fileScores.size === 0 && literalPaths.size === 0) return "";
+	// Resolve literal paths (exists-checked)
+	const literalPaths: string[] = [];
+	for (const p of paths) {
+		try {
+			const full = resolve(cwd, p);
+			if (existsSync(full) && statSync(full).isFile()) {
+				literalPaths.push(p.replace(/^\.\//, ""));
+			}
+		} catch {
+			// ignore
+		}
+	}
 
-	const sorted = [...fileScores.entries()]
-		.filter(([file]) => SRC_EXTENSIONS_REGEX.test(file))
-		.sort((a, b) => b[1] - a[1])
+	if (fileHits.size === 0 && literalPaths.length === 0) return "";
+
+	const sorted = [...fileHits.entries()]
+		.sort((a, b) => b[1].size - a[1].size)
 		.slice(0, 15);
 
 	const sections: string[] = [];
 
-	// Literal file paths first — most important signal
-	if (literalPaths.size > 0) {
-		sections.push("FILES EXPLICITLY NAMED IN THE TASK (start here):");
-		for (const p of literalPaths) {
-			sections.push(`- ${p}`);
-		}
+	if (literalPaths.length > 0) {
+		sections.push("FILES EXPLICITLY NAMED IN THE TASK (highest priority — start here):");
+		for (const p of literalPaths) sections.push(`- ${p}`);
 	}
 
 	if (sorted.length > 0) {
-		sections.push("\nLIKELY RELEVANT FILES (ranked by keyword matches):");
-		for (const [file, score] of sorted) {
-			sections.push(`- ${file} (score=${score})`);
+		sections.push("\nLIKELY RELEVANT FILES (ranked by task keyword matches):");
+		for (const [file, kws] of sorted) {
+			sections.push(`- ${file} (matches: ${[...kws].slice(0, 4).join(", ")})`);
 		}
 	}
 
 	// Style detection for the top file
-	const topFile = literalPaths.size > 0 ? [...literalPaths][0] : sorted[0]?.[0];
+	const topFile = literalPaths[0] || sorted[0]?.[0];
 	if (topFile) {
 		const style = detectFileStyle(cwd, topFile);
 		if (style) {
@@ -331,89 +284,105 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 		}
 	}
 
-	// Acceptance criteria extraction
-	const criteria = extractAcceptanceCriteria(taskText);
-	if (criteria.length > 0) {
-		sections.push(`\nACCEPTANCE CRITERIA (${criteria.length} total — address every one):`);
-		criteria.forEach((c, i) => sections.push(`${i + 1}. ${c}`));
+	// Acceptance criteria count
+	const criteriaCount = countAcceptanceCriteria(taskText);
+	if (criteriaCount > 0) {
+		sections.push(`\nThis task has ${criteriaCount} acceptance criteria.`);
+		if (criteriaCount >= 3) {
+			sections.push(
+				`Tasks with ${criteriaCount}+ criteria almost always require edits across multiple files. Do not stop after editing one file.`,
+			);
+		}
+	}
+
+	// Named files in backticks (additional hint)
+	const namedFiles = extractNamedFiles(taskText);
+	if (namedFiles.length > 0) {
+		sections.push(`\nFiles named in the task text: ${namedFiles.map((f) => `\`${f}\``).join(", ")}.`);
+		sections.push("Each named file likely needs an edit.");
 	}
 
 	return "\n\n" + sections.join("\n") + "\n";
 }
 
 /**
- * Tau scoring preamble — prepended to every system prompt for SN66 scoring optimization.
- *
- * Architecture (tau/src/validate.py + compare.py):
- *   - Validator injects its own scoring-aware prompt via -p flag. That prompt already
- *     covers: scoring formula, "read files IN FULL", "minimal changes", "match style",
- *     "no cosmetic changes", "alphabetical order", "no tests", "when unsure leave as-is".
- *   - This preamble must NOT duplicate those rules (wastes Gemini 2.5 Flash tokens).
- *     It should ONLY contain tactics the injected prompt does not cover.
+ * Tau scoring preamble — prepended to every system prompt for SN66 duel optimization.
  *
  * Scoring model (tau/src/compare.py):
- *   - difflib.SequenceMatcher builds changed_sequence per file (autojunk=False).
- *   - Duel winner = whoever has more raw matched_changed_lines vs Cursor baseline.
- *   - Implication: covering MORE of Cursor's files matters more than perfect ratio.
- *     Missing a file Cursor touched = forfeit ALL matched lines for that file.
+ *   difflib.SequenceMatcher builds a changed-line sequence per file, then counts
+ *   positional matches against a reference diff produced by Cursor on the same task.
+ *   Score = matched_changed_lines / max(seq_a, seq_b). The duel winner has more raw
+ *   matched lines (not ratio) against the baseline.
  *
  * Environment:
- *   - Model: Gemini 2.5 Flash via OpenRouter docker-proxy.
- *   - Cursor baseline: Gemini 3 Flash.
- *   - Time limit: min(2 * cursor_time + 1, 300) seconds — up to 5 minutes.
- *   - Tasks: real GitHub commits, minimum 100 changed code lines.
- *   - Container: node:20-bookworm-slim, 2GB RAM, 2 CPUs.
+ *   Model: Gemini 2.5 Flash via OpenRouter docker-proxy.
+ *   Baseline: Cursor running Gemini 3 Flash.
+ *   Time: min(2 * cursor_time + 1, 300) seconds.
+ *   Tasks: real GitHub commits, >= 100 changed code lines.
+ *
+ * Two failure modes:
+ *   1. MISS — not touching a file the reference touches. Forfeits all matched lines for that file.
+ *   2. BLOAT — touching extra lines. Inflates the denominator.
+ *   MISS is worse. Breadth-first coverage beats depth-first perfection.
  */
-const TAU_SCORING_PREAMBLE = `You are competing on Bittensor SN66. Your diff is compared against Cursor's diff on the same task using positional line-level exact matching. The duel winner has more raw matched_changed_lines than the opponent. Think "what would Cursor do?" — then produce exactly that diff.
+const TAU_SCORING_PREAMBLE = `You are competing on Bittensor SN66. Your diff is scored position-by-position against a reference diff produced by Cursor on the same task. The duel winner has more raw matched changed lines, not a better ratio. Think "what would Cursor do?" and produce exactly that diff.
 
-SPEED:
-- 40-300 seconds total. Never run tests, builds, linters, servers, or type checkers.
-- Your FIRST response MUST be a tool call. Do not write text or plans before acting.
-- Max 3 bash calls for file discovery. Prefer reading files directly.
+## Time Budget
+You have 40-300 seconds. Empty diff = zero score. A partial diff touching 3 of 5 target files always beats a perfect diff touching 1 of 5. Never run tests, builds, linters, formatters, servers, or git — the sandbox has no services. Limit bash to 2-3 calls for discovery. Your first response MUST be a tool call. Prose output is ignored.
 
-THE TWO WAYS TO LOSE:
-1. BLOAT — touching lines Cursor would not touch inflates your denominator.
-2. MISS — not touching a file Cursor touched forfeits ALL matches for that file.
-MISS is worse than BLOAT. If the task implies multiple files, edit all of them.
+## Phase 1 — Locate All Target Files
+If the prompt includes FILES EXPLICITLY NAMED or LIKELY RELEVANT FILES sections (auto-discovered from task keywords), those are your starting targets. Trust them.
 
-FILE DISCOVERY:
-- The prompt may include "FILES EXPLICITLY NAMED IN THE TASK" and "LIKELY RELEVANT FILES" sections auto-discovered from task keywords. Trust those — start there.
-- If files are literally named in the task text (like src/auth/login.ts), read them immediately.
-- Otherwise: find . -type f -name "*.EXT" | grep -v node_modules | head -40
-- Or: grep -rl "KEYWORD" --include="*.EXT" . | head -10
-- After your first edit, check sibling files: ls $(dirname <path>)/ — related files often need changes too.
-- If you read a file, edit it. Reading without editing wastes budget.
+Otherwise run ONE bash call:
+  find . -type f \\( -name "*.EXT" -o -name "*.json" \\) | grep -v node_modules | grep -v .git | head -50
+Or:
+  grep -rl "IDENTIFIER" --include="*.EXT" . | head -10
 
-STYLE DETECTION (MANDATORY before editing each file):
-- Read the first 30 lines. Note: indentation (tabs or N-space), quotes (single/double/backtick), semicolons (yes/no), trailing commas (yes/no), brace style, naming (camelCase/snake_case/PascalCase).
-- Every edit must match ALL of these character-for-character.
-- A single style mismatch on a line scores 0 for that line.
-- If DETECTED STYLE is already in the prompt, trust it — do not re-detect.
+The 'find' tool is also available for structured glob-based discovery.
 
-EDIT DISCIPLINE:
-- Use edit tool for existing files. write tool ONLY for genuinely new files (task must explicitly require a new file).
-- oldText anchors: 3-5 lines, uniquely matching. Shorter anchors are more likely to be unique.
-- If edit fails, re-read the file before retrying — the file may differ from what you assumed.
-- If you try the SAME oldText twice, stop and re-read.
-- Implement only what the task literally says. Do NOT extend logically. Do NOT add defensive code.
-- Append new entries (array items, switch cases, enum values, list items) to the END of their block.
-- Imports: add at the END of the existing import block, matching the style of adjacent imports.
-- New functions/methods/classes: add after the last similar existing block in the file.
-- No blank lines between your changes unless the surrounding code already has them.
-- String literals from the task: copy verbatim. Do not paraphrase.
-- Bug fixes: the minimal fix is correct. Do not add validation, error handling, type checks, or logging.
+## Phase 2 — Read and Absorb Style
+Read each target file IN FULL before editing. From the first 30 lines, note:
+- Indentation (tabs vs spaces, width)
+- Quote style (single vs double)
+- Semicolons, trailing commas, brace style
+- Naming convention
+Your edits must replicate ALL conventions character-for-character. A single style mismatch scores 0 on that line. If the prompt already has DETECTED STYLE, trust it — do not re-detect.
 
-SCOPE:
-- Count acceptance criteria. If the prompt includes "ACCEPTANCE CRITERIA", address every one.
-- 4+ criteria almost always need 4+ edits across 2+ files.
-- Reference solutions are typically 100-500 changed lines across 1-5 files.
-- Do not stop after one file if the task implies multiple.
-- Process files in alphabetical path order. Edit top-to-bottom within each file.
+## Phase 3 — Breadth-First Editing (critical for winning)
+Make ONE correct edit per target file before going back for a second pass on any file.
+- Touching 4 of 5 target files scores far higher than perfecting 1 of 5.
+- Do NOT re-read a file you already read unless a prior edit failed.
+- After each successful edit, immediately move to the NEXT unedited target.
+- Use edit for existing files. write ONLY for files the task explicitly requires to be created.
+- New files: place them alongside sibling files (check with ls \`dirname\` if unsure), not at the repo root.
+- Short oldText anchors (3-5 lines). On edit failure, re-read the file before retrying.
+- Never retry with the same oldText twice without re-reading.
+- Process files in alphabetical path order, top-to-bottom within each file.
+- Append new imports, array items, enum values, switch cases at the END of their block.
+- Copy string literals from the task verbatim.
+- Do NOT add comments, docstrings, type annotations, defensive checks, or error handling unless the task requires it.
+- Do NOT reorder imports, rename variables, or fix unrelated issues.
 
-STOP CONDITIONS:
-- Do not re-read files after editing to verify.
-- Do not commit, do not summarize, do not explain.
-- Stop immediately after the last edit. Every token after the last edit is wasted budget.
+## Phase 4 — Criteria Verification
+Walk through each acceptance criterion:
+- Does each have a corresponding working edit?
+- Conditional requirements ("if X, show Y") need an actual if check.
+- Behavioral requirements ("filters by category") need functioning logic, not placeholders.
+- Multi-part criteria ("A and also B") require both A and B implementations.
+- Every file named in the task must be edited.
+- 4+ criteria almost always span 2+ files.
+
+## Phase 5 — Stop
+Once every criterion is addressed: stop. No re-reads to verify, no summaries, no second passes. The harness reads your diff from disk.
+
+## Tie-Breaking Rules
+- Surgical fix over broader refactor. Always.
+- If unsure whether to touch a file, do not touch it.
+- If a defensive check "would be nice" but was not asked, omit it.
+- If unsure whether a line should change, leave it unchanged.
+- An imperfect diff touching 3 files (2 correct + 1 wrong) still scores on the 2 correct. Do not freeze. Ship the partial.
+
+---
 
 `;
 
@@ -455,11 +424,12 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 
 	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
 
+	const discoverySection = customPrompt ? buildTaskDiscoverySection(customPrompt, resolvedCwd) : "";
+
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
 
 	if (customPrompt) {
-		const discoverySection = buildTaskDiscoverySection(customPrompt, resolvedCwd);
 		let prompt = TAU_SCORING_PREAMBLE + discoverySection + customPrompt;
 
 		if (appendSection) {

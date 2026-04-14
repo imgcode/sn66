@@ -662,43 +662,35 @@ async function handleConfigCommand(args: string[]): Promise<boolean> {
 
 /**
  * Detect solver mode (--mode json --no-session) and apply defaults that
- * eliminate token waste from extensions, skills, prompts, themes, and
- * version checks. Disable thinking to maximize token budget for edits.
+ * eliminate token waste from extensions, skills, prompts, themes.
+ *
+ * Operates on a parsed Args object so flag state is tracked properly
+ * without the validator CLI seeing invented arguments.
  */
-function applySolverModeDefaults(args: string[]): void {
-	const hasMode = args.includes("--mode");
-	const hasNoSession = args.includes("--no-session");
-
-	if (hasMode && hasNoSession) {
-		// Force offline and skip version check
-		process.env.PI_OFFLINE = "1";
-		process.env.PI_SKIP_VERSION_CHECK = "1";
-
-		// Disable extensions, skills, prompt templates, themes if not already set
-		const disableFlags = [
-			"--no-extensions",
-			"--no-skills",
-			"--no-prompt-templates",
-			"--no-themes",
-		];
-		for (const flag of disableFlags) {
-			if (!args.includes(flag)) {
-				args.push(flag);
-			}
-		}
-
-		// Default thinking to "off" — saves tokens for actual file reads and edits.
-		// Gemini 2.5 Flash doesn't benefit much from extended thinking, and the
-		// runtime steering heuristics compensate for reasoning quality.
-		if (!args.includes("--thinking")) {
-			args.push("--thinking", "off");
-		}
+function applySolverModeDefaults(parsed: Args): void {
+	// Docker validator runs use: --mode json --no-session -p "<task prompt>".
+	// Keep this path deterministic and low-overhead by disabling optional resource
+	// systems unless explicitly requested.
+	const isSolverLikeRun = parsed.mode === "json" && parsed.noSession === true;
+	if (!isSolverLikeRun) {
+		return;
+	}
+	if (!parsed.extensions && !parsed.noExtensions) {
+		parsed.noExtensions = true;
+	}
+	if (!parsed.skills && !parsed.noSkills) {
+		parsed.noSkills = true;
+	}
+	if (!parsed.promptTemplates && !parsed.noPromptTemplates) {
+		parsed.noPromptTemplates = true;
+	}
+	if (!parsed.themes && !parsed.noThemes) {
+		parsed.noThemes = true;
 	}
 }
 
 export async function main(args: string[]) {
 	resetTimings();
-	applySolverModeDefaults(args);
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
 		process.env.PI_OFFLINE = "1";
@@ -715,6 +707,12 @@ export async function main(args: string[]) {
 
 	// First pass: parse args to get --extension paths
 	const firstPass = parseArgs(args);
+	applySolverModeDefaults(firstPass);
+	const solverLikeRun = firstPass.mode === "json" && firstPass.noSession === true;
+	if (solverLikeRun && !isTruthyEnvFlag(process.env.PI_OFFLINE)) {
+		process.env.PI_OFFLINE = "1";
+		process.env.PI_SKIP_VERSION_CHECK = "1";
+	}
 	time("parseArgs.firstPass");
 	const shouldTakeOverStdout = firstPass.mode !== undefined || firstPass.print || !process.stdin.isTTY;
 	if (shouldTakeOverStdout) {
@@ -778,6 +776,7 @@ export async function main(args: string[]) {
 
 	// Second pass: parse args with extension flags
 	const parsed = parseArgs(args, extensionFlags);
+	applySolverModeDefaults(parsed);
 	time("parseArgs.secondPass");
 
 	// Pass flag values to extensions via runtime
