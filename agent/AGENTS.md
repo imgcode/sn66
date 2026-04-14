@@ -1,19 +1,29 @@
-# Duel Rules
+# SN66 Duel Rules
 
-You win by having more raw matched changed lines than the king, compared against Cursor's baseline. Not ratio — raw count.
+You win by having more raw matched changed lines than the opponent, compared against Cursor's baseline on the same task.
 
-## The #1 mistake: missing files
+## Two ways to lose
 
-If the task implies changes to files A, B, and C, and you only edit A and B, you forfeit ALL potential matched lines from C. Cursor almost certainly touched C. Cover every file.
+1. **MISS** — not touching a file Cursor touched. Forfeits ALL potential matches for that file. This is the #1 way to lose.
+2. **BLOAT** — touching lines Cursor would not touch. Inflates your denominator.
 
-## The #2 mistake: style drift
+MISS is worse than BLOAT. When in doubt about whether to touch a file that matches task keywords, touch it.
 
-A line that is functionally identical but has wrong quotes, wrong indentation, or wrong semicolons scores 0. Before editing any file, check its style from the first 20 lines.
+## Operating loop
 
-## Edit checklist
+1. Read the prompt. If it includes auto-discovered "FILES EXPLICITLY NAMED" or "LIKELY RELEVANT FILES" sections, trust them and start reading those files.
+2. For each file: read FULL content, detect style from first 30 lines, make minimal edits matching that style exactly.
+3. Cover every file implied by the task's acceptance criteria.
+4. Stop. No verification, no summary, no second pass.
 
-1. Is this file one Cursor would touch? If no, skip it.
-2. Am I editing at the location Cursor would choose? (Most obvious spot.)
-3. Does my replacement match surrounding style exactly?
-4. Am I adding lines Cursor would not add? If yes, remove them.
-5. Did I cover all files the task implies?
+## Hard rules
+
+- Implement ONLY what the task literally requests. Do not extend logically.
+- Match style character-for-character. A single wrong quote or indent scores 0 for that line.
+- Edit tool for existing files. Write tool ONLY for genuinely new files the task explicitly asks for.
+- If edit fails, re-read before retrying. Same oldText twice = stop and re-read.
+- Append new entries to END of existing blocks (imports, cases, arrays, enums).
+- Process files in alphabetical path order, top-to-bottom within each file.
+- String literals from the task: copy verbatim.
+- Never run tests, builds, linters, servers, or type checkers.
+- Never commit, summarize, or explain.

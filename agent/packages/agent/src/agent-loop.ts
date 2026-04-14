@@ -156,7 +156,41 @@ const MAX_NO_TOOL_RETRIES = 2;
 const EDIT_ERROR_THRESHOLD_PER_FILE = 2;
 const TIME_WARNING_MS = 20_000;
 const HARD_EXIT_MS = 170_000;
+const MAX_COVERAGE_RETRIES = 2;
 const CONNECTION_REFUSED_PATTERNS = ["ConnectionRefusedError", "Connection refused", "ECONNREFUSED"];
+
+/**
+ * Parse the system prompt for "FILES EXPLICITLY NAMED" and "LIKELY RELEVANT FILES" sections
+ * that were injected by buildTaskDiscoverySection in coding-agent. Returns an ordered list
+ * of files we expect the model to touch.
+ */
+function parseExpectedFiles(systemPrompt: string): string[] {
+	const files: string[] = [];
+	const seen = new Set<string>();
+
+	// Match lines in the auto-discovery sections
+	const sections = [
+		/FILES EXPLICITLY NAMED IN THE TASK[^\n]*\n((?:[-*]\s+\S[^\n]*\n)+)/,
+		/LIKELY RELEVANT FILES[^\n]*\n((?:[-*]\s+\S[^\n]*\n)+)/,
+	];
+
+	for (const re of sections) {
+		const match = systemPrompt.match(re);
+		if (!match) continue;
+		const block = match[1];
+		const lineRe = /^[-*]\s+(\S[^(]*?)(?:\s+\(|\s*$)/gm;
+		let m: RegExpExecArray | null;
+		while ((m = lineRe.exec(block)) !== null) {
+			const file = m[1].trim();
+			if (file && !seen.has(file)) {
+				seen.add(file);
+				files.push(file);
+			}
+		}
+	}
+
+	return files;
+}
 
 /**
  * Main loop logic shared by agentLoop and agentLoopContinue.
@@ -179,9 +213,35 @@ async function runLoop(
 	let readsBeforeEdit = 0;
 	let providerErrorRetries = 0;
 	let noToolRetries = 0;
+	let coverageRetries = 0;
 	let timeWarningIssued = false;
 	const consecutiveEditErrors = new Map<string, number>();
 	const lastFailedOldText = new Map<string, string>();
+	const editedFiles = new Set<string>();
+	const expectedFiles = parseExpectedFiles(currentContext.systemPrompt || "");
+
+	/** Normalize a file path for coverage tracking: strip leading ./, lowercase drive letter. */
+	const normPath = (p: string): string => {
+		if (!p) return "";
+		return p.replace(/^\.\//, "").replace(/\\/g, "/").trim();
+	};
+
+	/** Files from expectedFiles that haven't been edited yet. */
+	const missingExpectedFiles = (): string[] => {
+		const missing: string[] = [];
+		for (const f of expectedFiles) {
+			const norm = normPath(f);
+			let touched = false;
+			for (const e of editedFiles) {
+				if (normPath(e) === norm || normPath(e).endsWith("/" + norm)) {
+					touched = true;
+					break;
+				}
+			}
+			if (!touched) missing.push(f);
+		}
+		return missing;
+	};
 
 	/** Inject a steering message into the conversation. */
 	const injectSteering = async (text: string): Promise<void> => {
@@ -272,6 +332,22 @@ async function runLoop(
 				continue;
 			}
 
+			// === FORCED FILE COVERAGE (v6) ===
+			// Model is about to stop but hasn't touched all expected files.
+			if (!hasMoreToolCalls && editSuccessCount > 0 && coverageRetries < MAX_COVERAGE_RETRIES) {
+				const missing = missingExpectedFiles();
+				if (missing.length > 0) {
+					coverageRetries++;
+					await emit({ type: "turn_end", message, toolResults: [] });
+					const list = missing.slice(0, 5).join(", ");
+					await injectSteering(
+						`Before stopping, check these files that match task keywords but have NOT been edited yet: ${list}. Read each and decide if it needs changes. Missing a required file means forfeiting all matched lines for it.`,
+					);
+					hasMoreToolCalls = true;
+					continue;
+				}
+			}
+
 			const toolResults: ToolResultMessage[] = [];
 			if (hasMoreToolCalls) {
 				toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit)));
@@ -337,6 +413,7 @@ async function runLoop(
 						} else {
 							// === EDIT SUCCESS ===
 							editSuccessCount++;
+							editedFiles.add(filePath);
 							consecutiveEditErrors.set(filePath, 0);
 							lastFailedOldText.delete(filePath);
 
