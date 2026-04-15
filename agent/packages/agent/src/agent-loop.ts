@@ -162,6 +162,43 @@ const MAX_COVERAGE_RETRIES = 2;
 const CONNECTION_REFUSED_PATTERNS = ["ConnectionRefusedError", "Connection refused", "ECONNREFUSED"];
 
 /**
+ * Parse find/grep/ls output into likely repo-relative file paths.
+ * Filters out error messages, system paths, `ls -l` headers, and other junk
+ * that would otherwise pollute the discovered file list.
+ */
+function extractCandidatePathsFromBashOutput(output: string, max = 24): string[] {
+	const paths: string[] = [];
+	const seen = new Set<string>();
+	for (const raw of output.split("\n")) {
+		let line = raw.trim();
+		if (!line || line.length > 280) continue;
+		// Skip tool error prefixes
+		if (/^(find:|grep:|bash:)/i.test(line)) continue;
+		// Skip absolute system paths
+		if (line.startsWith("/usr/") || line.startsWith("/bin/") || line.startsWith("/etc/")) continue;
+		// Skip `ls -l` total header
+		if (/^total \d+$/i.test(line)) continue;
+		line = line.replace(/^\.\//, "");
+		// Skip node_modules and .git entries
+		if (line.includes("node_modules") || line.includes("/.git/") || line === ".git") continue;
+		const base = line.split("/").pop() ?? line;
+		// Recognize root-level files that might not have an extension
+		const knownRootFiles = /^(dockerfile|makefile|license|readme\.md|\.gitignore|\.env)$/i.test(base);
+		const hasFileExt = /\.[A-Za-z0-9]{1,12}$/.test(line);
+		const pathLike =
+			/^[\w@./+,-]+$/.test(line) &&
+			line.length >= 2 &&
+			(line.includes("/") || hasFileExt || knownRootFiles);
+		if (!pathLike) continue;
+		if (seen.has(line)) continue;
+		seen.add(line);
+		paths.push(line);
+		if (paths.length >= max) break;
+	}
+	return paths;
+}
+
+/**
  * Parse the system prompt for "FILES EXPLICITLY NAMED" and "LIKELY RELEVANT FILES" sections
  * that were injected by buildTaskDiscoverySection in coding-agent. Returns an ordered list
  * of files we expect the model to touch.
@@ -540,12 +577,9 @@ async function runLoop(
 								tr.content
 									?.map((c: { type: string; text?: string }) => (c.type === "text" ? c.text || "" : ""))
 									.join("") || "";
-							const paths = output
-								.split("\n")
-								.filter((l: string) => l.trim().match(/\.\w+$/))
-								.map((l: string) => l.trim());
+							const paths = extractCandidatePathsFromBashOutput(output, 24);
 							if (paths.length > 0) {
-								foundFiles = paths.slice(0, 20);
+								foundFiles = paths.slice(0, 24);
 								workPhase = "absorb";
 								pendingMessages.push({
 									role: "user",
